@@ -27,6 +27,9 @@ Canonical repository URL: `https://github.com/sharaf-nassar/release-me`
   app-specific heuristics, CI-vendor assumptions, or downstream branding.
 - Treat semver tags as the contract. `get_latest_tag` should continue to look at
   `vMAJOR.MINOR.PATCH` tags only.
+- `bump --version` is an exact semver-tag override and remains scoped to
+  `bump`. It must not require or accept `major`, `minor`, or `patch`. Do not
+  extend it to `retag` unless the user explicitly requests it.
 - `retag` is latest-only by design. Do not reintroduce arbitrary-tag retagging
   unless the user explicitly requests that behavior.
 - Keep release-note generation focused on user-visible changes unless the user

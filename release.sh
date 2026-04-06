@@ -18,15 +18,17 @@ Options:
 
 Commands:
   bump <major|minor|patch>   Create and push a new version tag
+  bump --version vX.Y.Z      Create and push an explicit version tag
   retag                      Replace the latest tag locally and remotely
   latest                     Show the latest version tag
 
 Examples:
   ./release.sh --ai auto bump patch   # Prefer Codex, fall back to Claude
   ./release.sh --ai claude bump patch # Force Claude for release notes
-  ./release.sh bump patch        # v0.2.1 -> v0.2.2
-  ./release.sh bump minor        # v0.2.1 -> v0.3.0
-  ./release.sh bump major        # v0.2.1 -> v1.0.0
+  ./release.sh bump patch            # v0.2.1 -> v0.2.2
+  ./release.sh bump --version v1.2.3 # Use an explicit tag
+  ./release.sh bump minor            # v0.2.1 -> v0.3.0
+  ./release.sh bump major            # v0.2.1 -> v1.0.0
   ./release.sh retag             # Re-point the latest tag to current HEAD
   ./release.sh latest            # Print latest tag
 EOF
@@ -40,6 +42,16 @@ get_latest_tag() {
 parse_version() {
   local tag="$1"
   echo "${tag#v}"
+}
+
+print_bump_usage() {
+  echo "Usage: ./release.sh bump <major|minor|patch>"
+  echo "       ./release.sh bump --version vX.Y.Z"
+}
+
+is_semver_tag() {
+  local tag="$1"
+  [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
 }
 
 bump_version() {
@@ -339,13 +351,52 @@ resolve_ai_cli() {
 }
 
 cmd_bump() {
-  local part="${1:-}"
-  if [[ -z "$part" || ! "$part" =~ ^(major|minor|patch)$ ]]; then
-    echo "Usage: ./release.sh bump <major|minor|patch>"
+  local part=""
+  local version_override=""
+
+  if [[ $# -eq 0 ]]; then
+    print_bump_usage
     exit 1
   fi
 
-  local latest current new_version
+  if [[ "$1" == "--version" ]]; then
+    if [[ $# -lt 2 ]]; then
+      echo "Missing value for --version" >&2
+      print_bump_usage
+      exit 1
+    fi
+    version_override="$2"
+    shift 2
+    if [[ $# -gt 0 ]]; then
+      echo "Do not pass major, minor, or patch when using --version." >&2
+      print_bump_usage
+      exit 1
+    fi
+  else
+    part="$1"
+    if [[ ! "$part" =~ ^(major|minor|patch)$ ]]; then
+      print_bump_usage
+      exit 1
+    fi
+    shift
+    if [[ $# -gt 0 ]]; then
+      if [[ "$1" == "--version" ]]; then
+        echo "Do not pass major, minor, or patch when using --version." >&2
+      else
+        echo "Unknown argument for bump: $1" >&2
+      fi
+      print_bump_usage
+      exit 1
+    fi
+  fi
+
+  if [[ -n "$version_override" ]] && ! is_semver_tag "$version_override"; then
+    echo "Invalid value for --version: $version_override" >&2
+    echo "--version must use the existing tag format: vMAJOR.MINOR.PATCH" >&2
+    exit 1
+  fi
+
+  local latest current new_tag
   latest=$(get_latest_tag)
   if [[ -z "$latest" ]]; then
     current="0.0.0"
@@ -353,9 +404,23 @@ cmd_bump() {
     current=$(parse_version "$latest")
   fi
 
-  new_version=$(bump_version "$current" "$part")
+  if [[ -n "$version_override" ]]; then
+    new_tag="$version_override"
+  else
+    new_tag="v$(bump_version "$current" "$part")"
+  fi
+
+  if git rev-parse -q --verify "refs/tags/${new_tag}" > /dev/null 2>&1; then
+    echo "Tag ${new_tag} already exists." >&2
+    exit 1
+  fi
+
   echo "Current version: ${current}"
-  echo "New version:     v${new_version}"
+  if [[ -n "$version_override" ]]; then
+    echo "New version:     ${new_tag} (override)"
+  else
+    echo "New version:     ${new_tag}"
+  fi
   echo ""
 
   local ai_cli
@@ -363,24 +428,24 @@ cmd_bump() {
 
   echo "Generating release notes with ${ai_cli}..."
   local notes
-  notes=$(generate_notes "$latest" "v${new_version}" "$ai_cli")
+  notes=$(generate_notes "$latest" "$new_tag" "$ai_cli")
   echo ""
   echo "--- Release Notes ---"
   echo "$notes"
   echo "---------------------"
   echo ""
 
-  read -rp "Create and push tag v${new_version}? [Y/n] " confirm
+  read -rp "Create and push tag ${new_tag}? [Y/n] " confirm
   if [[ "$confirm" == [nN] ]]; then
     echo "Aborted."
     exit 0
   fi
 
-  git tag -a "v${new_version}" -m "Release v${new_version}
+  git tag -a "${new_tag}" -m "Release ${new_tag}
 
 ${notes}"
-  git push origin "v${new_version}"
-  echo "Pushed v${new_version} - CI release workflow will start automatically."
+  git push origin "${new_tag}"
+  echo "Pushed ${new_tag} - CI release workflow will start automatically."
 }
 
 cmd_retag() {

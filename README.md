@@ -47,6 +47,7 @@ repository root:
 
 ```bash
 ./release.sh bump patch
+./release.sh bump --version v1.2.3
 ./release.sh bump minor
 ./release.sh bump major
 ./release.sh retag
@@ -65,6 +66,9 @@ project.
 
 - `bump <major|minor|patch>` creates the next semver tag, generates release
   notes, creates an annotated tag, and pushes it to `origin`.
+- `bump --version vX.Y.Z` uses the exact semver tag you provide instead of
+  calculating the next version. The override must use the existing tag format
+  and cannot be combined with `major`, `minor`, or `patch`.
 - `retag` always re-points the latest semver tag to the current `HEAD`. Any
   extra positional arguments are ignored for backward compatibility.
 - `latest` prints the latest semver tag in `vX.Y.Z` format.
@@ -95,4 +99,5 @@ AI backend selection:
   - `claude`
 
 If no semver tags exist yet, `bump` starts from `v0.0.0` and creates the first
-release tag from there.
+release tag from there. With `--version`, `bump` skips that calculation and
+uses the explicit tag you pass.
