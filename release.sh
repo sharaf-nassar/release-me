@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CODEX_MODEL="gpt-5.4"
+CODEX_MODEL="gpt-5.5"
 CODEX_REASONING_EFFORT="xhigh"
 CODEX_SERVICE_TIER="fast"
 CODEX_PROGRESS_LINES=20
@@ -19,7 +19,7 @@ Options:
 Commands:
   bump <major|minor|patch>   Create and push a new version tag
   bump --version vX.Y.Z      Create and push an explicit version tag
-  retag                      Replace the latest tag locally and remotely
+  retag                      Delete the GitHub release and replace the latest tag
   latest                     Show the latest version tag
 
 Examples:
@@ -29,14 +29,14 @@ Examples:
   ./release.sh bump --version v1.2.3 # Use an explicit tag
   ./release.sh bump minor            # v0.2.1 -> v0.3.0
   ./release.sh bump major            # v0.2.1 -> v1.0.0
-  ./release.sh retag             # Re-point the latest tag to current HEAD
+  ./release.sh retag             # Delete the GitHub release and re-point latest tag
   ./release.sh latest            # Print latest tag
 EOF
   exit "$exit_code"
 }
 
 get_latest_tag() {
-  git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1
+  git tag --sort=-v:refname | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { print; exit }'
 }
 
 parse_version() {
@@ -258,33 +258,75 @@ generate_notes() {
     range="${prev_tag}..HEAD"
   fi
 
-  local commits diff_stat
-  commits=$(git log "$range" --pretty=format:"- %s" --no-merges)
+  local commits changed_files diff_stat
+  commits=$(git log "$range" --pretty=format:"- %s%n%b" --no-merges)
+  changed_files=$(git diff "${prev_tag:-$(git rev-list --max-parents=0 HEAD)}..HEAD" --name-status)
   diff_stat=$(git diff "${prev_tag:-$(git rev-list --max-parents=0 HEAD)}..HEAD" --stat)
 
   local prompt
   prompt=$(
     cat << PROMPT
-You are writing release notes for this repo.
+You are writing customer-facing GitHub release notes for this repo.
 
-Focus ONLY on new features and capabilities that are visible in the app.
-For each feature, write a bold heading and 1-2 sentences describing what it does.
-Write directly about the feature, not from the user's perspective — avoid "you can",
-"your", "lets you". Example: "Review and approve suggestions with a diff preview"
-not "You can now review and approve suggestions".
+Write for people deciding whether to use or upgrade to this release. Make the
+release sound useful and easy to scan without hype, filler, or implementation
+jargon. Translate code changes into product value. If the source material does
+not prove a claim, do not invent it.
 
-OMIT entirely: bug fixes, refactors, dependency updates, CI changes, internal
-architecture changes, performance improvements, and anything not visible in the app.
-If a commit is purely technical with no visible impact, skip it.
+Prioritize:
+1. New user-visible capabilities and workflows.
+2. Meaningful improvements to existing behavior.
+3. User-visible bug fixes or reliability improvements.
+4. Breaking changes, migration steps, or required user action.
 
-Output format — a flat list under a single "## What's New" heading. No sub-sections.
-If there are zero visible changes, output "Maintenance release — no user-facing changes."
+Omit internal-only work: refactors, dependency bumps, CI changes, formatting,
+test-only changes, tool churn, and commit hashes. Never write generic phrases
+like "various fixes and improvements".
+
+Use this Markdown structure, omitting sections that have no meaningful items.
+Do not include a top-level title, heading, or version line at the start of the
+notes — begin directly with the description paragraph below. Do not mention the
+version tag (e.g., "${new_tag}", "v1.2.3", or any "vX.Y.Z" string) anywhere in
+the opening paragraph; the release title already shows it. The first sentence
+must start with the change itself, not the version.
+
+Open with 2-3 short sentences that summarize the biggest user-facing value in
+this release. Mention the strongest feature first. If there are no user-facing
+changes, output only: "Maintenance release — no user-facing changes."
+
+### Highlights
+- **Benefit-led headline** - One or two plain-language sentences explaining
+  what changed, why it matters, and how users benefit.
+
+### Improvements
+- **Result-focused headline** - One sentence about an improved workflow,
+  clearer behavior, or smoother experience.
+
+### Fixes
+- **Issue users no longer hit** - One sentence explaining what is now more
+  reliable, clearer, or less error-prone.
+
+### Upgrade Notes
+- Required user action, breaking behavior, compatibility notes, or migration
+  guidance. Be concrete and direct.
+
+Rules:
+- Do not include empty sections.
+- Prefer 3-7 total bullets across all sections.
+- Merge related commits into one readable item.
+- If a bullet only describes implementation, omit it.
+- Use active, specific language. Avoid "you can" as the default sentence shape.
+- Keep each bullet self-contained and under 40 words when possible.
+- Do not include "Full changelog", contributor lists, file names, or commit hashes.
 
 Version: ${new_tag}
 Previous version: ${prev_tag:-"(first release)"}
 
-Commits:
+Commit details:
 ${commits}
+
+Changed files:
+${changed_files}
 
 Files changed:
 ${diff_stat}
@@ -306,7 +348,7 @@ PROMPT
       rm -f "$output_file"
       ;;
     claude)
-      notes=$(claude -p --model haiku --output-format text --no-session-persistence "$prompt" 2> /dev/null)
+      notes=$(claude -p --model claude-opus-4-7 --output-format text --no-session-persistence "$prompt" 2> /dev/null)
       ;;
     *)
       echo "Unknown AI CLI: $ai_cli" >&2
@@ -348,6 +390,39 @@ resolve_ai_cli() {
       return 1
       ;;
   esac
+}
+
+delete_github_release_for_tag() {
+  local tag="$1"
+
+  if ! command -v gh > /dev/null 2>&1; then
+    echo "Retagging requires the GitHub CLI (gh) so the existing GitHub release can be deleted." >&2
+    echo "Install gh and authenticate it with write access to this repository." >&2
+    return 1
+  fi
+
+  local lookup_output lookup_status=0
+  lookup_output=$(gh release view "$tag" --json tagName --jq .tagName 2>&1) || lookup_status=$?
+
+  if ((lookup_status == 0)); then
+    echo "Deleting GitHub release for $tag..."
+    gh release delete "$tag" --yes
+    return 0
+  fi
+
+  if ((lookup_status == 4)); then
+    echo "GitHub CLI is not authenticated. Run 'gh auth login' before retagging." >&2
+    return 1
+  fi
+
+  if [[ "$lookup_output" == *"release not found"* || "$lookup_output" == *"Not Found"* ]]; then
+    echo "No GitHub release found for $tag."
+    return 0
+  fi
+
+  echo "Failed to check GitHub release for $tag:" >&2
+  echo "$lookup_output" >&2
+  return 1
 }
 
 cmd_bump() {
@@ -441,7 +516,7 @@ cmd_bump() {
     exit 0
   fi
 
-  git tag -a "${new_tag}" -m "Release ${new_tag}
+  git tag -a --cleanup=verbatim "${new_tag}" -m "Release ${new_tag}
 
 ${notes}"
   git push origin "${new_tag}"
@@ -460,13 +535,13 @@ cmd_retag() {
 
   # Find the tag before this one for release notes range
   local prev_tag
-  prev_tag=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -v "^${tag}$" | head -n1)
+  prev_tag=$(git tag --sort=-v:refname | awk -v tag="$tag" '$0 ~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ && $0 != tag { print; exit }')
 
   local ai_cli
   ai_cli=$(resolve_ai_cli "$AI_CLI")
 
   echo "This will re-point $tag to HEAD ($(git rev-parse --short HEAD))."
-  echo "WARNING: This deletes the tag on the remote and re-pushes it."
+  echo "WARNING: This deletes the GitHub release and remote tag, then re-pushes the tag."
   echo ""
 
   # Extract previous release notes from the existing tag annotation
@@ -509,8 +584,9 @@ cmd_retag() {
     exit 0
   fi
 
+  delete_github_release_for_tag "$tag"
   git tag -d "$tag"
-  git tag -a "$tag" -m "Release ${tag}
+  git tag -a --cleanup=verbatim "$tag" -m "Release ${tag}
 
 ${notes}"
   git push origin ":refs/tags/$tag"

@@ -69,19 +69,37 @@ project.
 - `bump --version vX.Y.Z` uses the exact semver tag you provide instead of
   calculating the next version. The override must use the existing tag format
   and cannot be combined with `major`, `minor`, or `patch`.
-- `retag` always re-points the latest semver tag to the current `HEAD`. Any
-  extra positional arguments are ignored for backward compatibility.
+- `retag` deletes the existing GitHub Release for the latest semver tag when one
+  exists, then re-points that tag to the current `HEAD`. It requires an
+  authenticated GitHub CLI (`gh`) with write access so stale release records and
+  assets are removed before the tag is pushed again. Any extra positional
+  arguments are ignored for backward compatibility.
 - `latest` prints the latest semver tag in `vX.Y.Z` format.
 
 ## Release Notes
 
-Release notes are generated from commit subjects plus a `git diff --stat`
-summary. The prompt is intentionally strict:
+Release notes are generated from commit details, changed file names, and a
+`git diff --stat` summary. The prompt favors a customer-facing product
+announcement over a raw changelog:
 
-- It includes only user-visible features and capabilities.
-- It omits bug fixes, refactors, dependency updates, CI changes, and other
-  internal-only work.
+- It opens directly with a short description of the biggest user-facing value
+  in the release, with no top-level title or heading.
+- It groups useful changes into `Highlights`, `Improvements`, `Fixes`, and
+  `Upgrade Notes` sections when those sections have meaningful content.
+- It includes user-visible fixes and upgrade notes, but omits refactors,
+  dependency updates, CI changes, test-only work, and other internal-only work.
+- It avoids generic phrases such as "various fixes and improvements."
 - If there are no user-facing changes, it emits a maintenance-release message.
+
+Generated Markdown is stored in the annotated tag message with Git cleanup
+disabled. This preserves Markdown headings such as `### Highlights`, which Git
+would otherwise treat as comment lines.
+
+If a GitHub Actions workflow publishes the release from the tag annotation,
+restore the remote tag object after `actions/checkout` before reading it.
+Checkout may replace the local tag ref with a lightweight tag pointing at the
+commit, which makes `git tag --format='%(body)'` return the commit body instead
+of the release notes.
 
 AI backend selection:
 
