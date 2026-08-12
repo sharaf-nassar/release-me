@@ -35,6 +35,10 @@ Canonical repository URL: `https://github.com/sharaf-nassar/release-me`
 - `retag` must delete the existing GitHub Release for the latest tag before
   deleting and re-pushing the remote tag. Keep this separate from tag cleanup so
   release deletion cannot accidentally replace the explicit git tag flow.
+- `bump --dry-run` and `retag --dry-run` must generate fresh release notes and
+  make no local tag, remote tag, or GitHub Release changes.
+- Codex must resolve from `PATH` and use its normal user and consuming-project
+  configuration. Do not override its model, provider, or reasoning effort.
 - Keep release-note generation focused on user-visible changes unless the user
   asks to broaden the scope.
 - Keep generated release notes in annotated tags with Git cleanup disabled so

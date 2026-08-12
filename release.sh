@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CODEX_MODEL="gpt-5.5"
-CODEX_REASONING_EFFORT="xhigh"
-CODEX_SERVICE_TIER="fast"
 CODEX_PROGRESS_LINES=20
 CODEX_PROGRESS_SCAN_LINES=200
 CODEX_PROGRESS_INTERVAL_SECONDS=0.1
@@ -15,21 +12,26 @@ Usage: ./release.sh [--ai auto|codex|claude] <command> [args]
 
 Options:
   --ai <auto|codex|claude>  Select the CLI used for release notes (default: auto)
+  Codex uses the executable from PATH and its normal user/project configuration.
 
 Commands:
-  bump <major|minor|patch>   Create and push a new version tag
-  bump --version vX.Y.Z      Create and push an explicit version tag
-  retag                      Delete the GitHub release and replace the latest tag
+  bump [--dry-run] <major|minor|patch>
+                             Create and push a new version tag
+  bump [--dry-run] --version vX.Y.Z
+                             Create and push an explicit version tag
+  retag [--dry-run]          Delete the GitHub release and replace the latest tag
   latest                     Show the latest version tag
 
 Examples:
   ./release.sh --ai auto bump patch   # Prefer Codex, fall back to Claude
   ./release.sh --ai claude bump patch # Force Claude for release notes
   ./release.sh bump patch            # v0.2.1 -> v0.2.2
+  ./release.sh bump --dry-run patch  # Generate notes without creating a tag
   ./release.sh bump --version v1.2.3 # Use an explicit tag
   ./release.sh bump minor            # v0.2.1 -> v0.3.0
   ./release.sh bump major            # v0.2.1 -> v1.0.0
   ./release.sh retag             # Delete the GitHub release and re-point latest tag
+  ./release.sh retag --dry-run   # Regenerate notes without changing the release or tag
   ./release.sh latest            # Print latest tag
 EOF
   exit "$exit_code"
@@ -45,8 +47,8 @@ parse_version() {
 }
 
 print_bump_usage() {
-  echo "Usage: ./release.sh bump <major|minor|patch>"
-  echo "       ./release.sh bump --version vX.Y.Z"
+  echo "Usage: ./release.sh bump [--dry-run] <major|minor|patch>"
+  echo "       ./release.sh bump [--dry-run] --version vX.Y.Z"
 }
 
 is_semver_tag() {
@@ -199,9 +201,6 @@ run_codex_with_progress() {
     --ephemeral \
     --color never \
     -C "$repo_root" \
-    -m "$CODEX_MODEL" \
-    -c "model_reasoning_effort=\"$CODEX_REASONING_EFFORT\"" \
-    -c "service_tier=\"$CODEX_SERVICE_TIER\"" \
     -o "$output_file" \
     - < "$prompt_file" > /dev/null 2> "$log_file" &
   pid=$!
@@ -364,6 +363,26 @@ PROMPT
   echo "$notes"
 }
 
+create_release_tag() {
+  local tag="$1" notes="$2"
+
+  git tag -a --cleanup=verbatim "$tag" -m "$notes"
+}
+
+extract_release_notes_from_tag() {
+  local tag="$1"
+  local contents legacy_header
+
+  contents=$(git tag -l --format='%(contents)' "$tag")
+  legacy_header="Release ${tag}"$'\n\n'
+
+  if [[ "$contents" == "$legacy_header"* ]]; then
+    contents="${contents#"$legacy_header"}"
+  fi
+
+  printf '%s\n' "$contents"
+}
+
 resolve_ai_cli() {
   local preference="${1:-auto}"
 
@@ -428,6 +447,12 @@ delete_github_release_for_tag() {
 cmd_bump() {
   local part=""
   local version_override=""
+  local dry_run=0
+
+  if [[ "${1:-}" == "--dry-run" ]]; then
+    dry_run=1
+    shift
+  fi
 
   if [[ $# -eq 0 ]]; then
     print_bump_usage
@@ -510,20 +535,29 @@ cmd_bump() {
   echo "---------------------"
   echo ""
 
+  if ((dry_run)); then
+    echo "Dry run complete. No local tag was created or pushed."
+    return
+  fi
+
   read -rp "Create and push tag ${new_tag}? [Y/n] " confirm
   if [[ "$confirm" == [nN] ]]; then
     echo "Aborted."
     exit 0
   fi
 
-  git tag -a --cleanup=verbatim "${new_tag}" -m "Release ${new_tag}
-
-${notes}"
+  create_release_tag "$new_tag" "$notes"
   git push origin "${new_tag}"
   echo "Pushed ${new_tag} - CI release workflow will start automatically."
 }
 
 cmd_retag() {
+  local dry_run=0
+  if [[ "${1:-}" == "--dry-run" ]]; then
+    dry_run=1
+    shift
+  fi
+
   local latest
   latest=$(get_latest_tag)
   if [[ -z "$latest" ]]; then
@@ -540,43 +574,61 @@ cmd_retag() {
   local ai_cli
   ai_cli=$(resolve_ai_cli "$AI_CLI")
 
-  echo "This will re-point $tag to HEAD ($(git rev-parse --short HEAD))."
-  echo "WARNING: This deletes the GitHub release and remote tag, then re-pushes the tag."
+  if ((dry_run)); then
+    echo "Dry run: $tag would be re-pointed to HEAD ($(git rev-parse --short HEAD))."
+  else
+    echo "This will re-point $tag to HEAD ($(git rev-parse --short HEAD))."
+    echo "WARNING: This deletes the GitHub release and remote tag, then re-pushes the tag."
+  fi
   echo ""
 
-  # Extract previous release notes from the existing tag annotation
-  local prev_notes
-  prev_notes=$(git tag -l --format='%(contents:body)' "$tag" | sed '/^$/d')
-
   local notes
-  if [[ -n "$prev_notes" ]]; then
-    echo "--- Previous Release Notes ---"
-    echo "$prev_notes"
-    echo "------------------------------"
-    echo ""
-    read -rp "Use previous release notes? [Y/n] " use_prev
-    if [[ "$use_prev" == [nN] ]]; then
-      echo ""
-      echo "Generating new release notes with ${ai_cli}..."
-      notes=$(generate_notes "$prev_tag" "$tag" "$ai_cli")
-      echo ""
-      echo "--- New Release Notes ---"
-      echo "$notes"
-      echo "-------------------------"
-    else
-      notes="$prev_notes"
-    fi
-  else
-    echo "No previous release notes found on $tag."
-    echo ""
+  if ((dry_run)); then
     echo "Generating release notes with ${ai_cli}..."
     notes=$(generate_notes "$prev_tag" "$tag" "$ai_cli")
     echo ""
     echo "--- Release Notes ---"
     echo "$notes"
     echo "---------------------"
+  else
+    # Extract previous release notes from the existing tag annotation
+    local prev_notes
+    prev_notes=$(extract_release_notes_from_tag "$tag")
+
+    if [[ -n "${prev_notes//[[:space:]]/}" ]]; then
+      echo "--- Previous Release Notes ---"
+      echo "$prev_notes"
+      echo "------------------------------"
+      echo ""
+      read -rp "Use previous release notes? [Y/n] " use_prev
+      if [[ "$use_prev" == [nN] ]]; then
+        echo ""
+        echo "Generating new release notes with ${ai_cli}..."
+        notes=$(generate_notes "$prev_tag" "$tag" "$ai_cli")
+        echo ""
+        echo "--- New Release Notes ---"
+        echo "$notes"
+        echo "-------------------------"
+      else
+        notes="$prev_notes"
+      fi
+    else
+      echo "No previous release notes found on $tag."
+      echo ""
+      echo "Generating release notes with ${ai_cli}..."
+      notes=$(generate_notes "$prev_tag" "$tag" "$ai_cli")
+      echo ""
+      echo "--- Release Notes ---"
+      echo "$notes"
+      echo "---------------------"
+    fi
   fi
   echo ""
+
+  if ((dry_run)); then
+    echo "Dry run complete. No GitHub release or local or remote tag was changed."
+    return
+  fi
 
   read -rp "Continue? [Y/n] " confirm
   if [[ "$confirm" == [nN] ]]; then
@@ -586,9 +638,7 @@ cmd_retag() {
 
   delete_github_release_for_tag "$tag"
   git tag -d "$tag"
-  git tag -a --cleanup=verbatim "$tag" -m "Release ${tag}
-
-${notes}"
+  create_release_tag "$tag" "$notes"
   git push origin ":refs/tags/$tag"
   git push origin "$tag"
   echo "Re-tagged $tag to $(git rev-parse --short HEAD) locally and remotely."
