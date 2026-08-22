@@ -56,6 +56,15 @@ repository root:
 ./release.sh latest
 ```
 
+For an npm monorepo with `.release-me.json`, include the package name:
+
+```bash
+./release.sh bump patch proper-base
+./release.sh bump --dry-run minor proper-flow
+./release.sh bump --version v1.0.0 proper-base
+./release.sh latest proper-base
+```
+
 The symlink should live at the consuming repo root and point to
 `tools/release-me/release.sh`.
 
@@ -63,6 +72,39 @@ Do not `cd` into the submodule before running the script. The script uses
 `git` commands against the current working directory, so running it from inside
 the submodule would tag the submodule repository instead of the consuming
 project.
+
+## npm package configuration
+
+Repositories opt into package-aware npm releases with `.release-me.json` at the
+consuming repository root:
+
+```json
+{
+  "type": "npm",
+  "branch": "main",
+  "packages": {
+    "proper-base": "proper-base/package.json",
+    "proper-flow": "proper-flow/package.json"
+  }
+}
+```
+
+The package argument must match the selected manifest's `name`. Manifest paths
+must be tracked, repository-relative package JSON files. Package mode requires
+Node.js and npm; repositories without this file keep the original repository
+release behavior and dependencies.
+
+Package tags use `<package>-vMAJOR.MINOR.PATCH`. A non-dry-run package bump:
+
+1. Requires the configured release branch and a clean worktree.
+1. Generates package-scoped release notes from that package's path.
+1. Updates only the selected `package.json` version.
+1. Runs `npm pack --dry-run`, commits the version, and creates an annotated tag.
+1. Atomically pushes the release branch and package tag to `origin`.
+
+If validation or the atomic push fails, the local release commit and tag are
+rolled back. npm package tags cannot be retagged because published registry
+versions are immutable; create a patch release instead.
 
 ## Commands
 
@@ -82,6 +124,9 @@ project.
 - `retag --dry-run` regenerates and displays release notes for the latest tag
   without changing the GitHub Release or any local or remote tag.
 - `latest` prints the latest semver tag in `vX.Y.Z` format.
+- In npm mode, `bump` requires a trailing configured package name and `latest`
+  requires one package name. The latest tag and release-note range are scoped
+  to that package. `retag` is disabled.
 
 ## Release Notes
 
@@ -121,6 +166,7 @@ AI backend selection:
 ## Requirements
 
 - `git`
+- Node.js and npm only for repositories with `.release-me.json`
 - `pre-commit` for local development
 - An `origin` remote on the consuming repository
 - At least one of:

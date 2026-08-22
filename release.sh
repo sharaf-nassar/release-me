@@ -14,7 +14,7 @@ Options:
   --ai <auto|codex|claude>  Select the CLI used for release notes (default: auto)
   Codex uses the executable from PATH and its normal user/project configuration.
 
-Commands:
+Commands without .release-me.json:
   bump [--dry-run] <major|minor|patch>
                              Create and push a new version tag
   bump [--dry-run] --version vX.Y.Z
@@ -22,38 +22,74 @@ Commands:
   retag [--dry-run]          Delete the GitHub release and replace the latest tag
   latest                     Show the latest version tag
 
+Commands with npm-style .release-me.json:
+  bump [--dry-run] <major|minor|patch> <package>
+                             Commit a package version and push its tag
+  bump [--dry-run] --version vX.Y.Z <package>
+                             Commit and tag an explicit package version
+  latest <package>           Show the latest package version tag
+
 Examples:
   ./release.sh --ai auto bump patch   # Prefer Codex, fall back to Claude
   ./release.sh --ai claude bump patch # Force Claude for release notes
-  ./release.sh bump patch            # v0.2.1 -> v0.2.2
-  ./release.sh bump --dry-run patch  # Generate notes without creating a tag
-  ./release.sh bump --version v1.2.3 # Use an explicit tag
-  ./release.sh bump minor            # v0.2.1 -> v0.3.0
-  ./release.sh bump major            # v0.2.1 -> v1.0.0
-  ./release.sh retag             # Delete the GitHub release and re-point latest tag
-  ./release.sh retag --dry-run   # Regenerate notes without changing the release or tag
-  ./release.sh latest            # Print latest tag
+  ./release.sh bump patch             # v0.2.1 -> v0.2.2
+  ./release.sh bump --dry-run patch   # Generate notes without creating a tag
+  ./release.sh bump --version v1.2.3  # Use an explicit tag
+  ./release.sh bump minor             # v0.2.1 -> v0.3.0
+  ./release.sh bump major             # v0.2.1 -> v1.0.0
+  ./release.sh retag                  # Delete the GitHub release and re-point latest tag
+  ./release.sh retag --dry-run        # Regenerate notes without changing the release or tag
+  ./release.sh latest                 # Print latest tag
+  ./release.sh bump patch my-package  # my-package-v1.2.4 in npm mode
+  ./release.sh latest my-package      # Print latest package tag
 EOF
   exit "$exit_code"
 }
 
-get_latest_tag() {
-  git tag --sort=-v:refname | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { print; exit }'
-}
+RELEASE_CONFIG_FILE=".release-me.json"
+RELEASE_MODE="legacy"
+RELEASE_BRANCH=""
+RELEASE_PACKAGE=""
+RELEASE_PACKAGE_MANIFEST=""
+RELEASE_PACKAGE_PATH=""
+RELEASE_PACKAGE_VERSION=""
+RELEASE_TAG_PREFIX="v"
 
-parse_version() {
-  local tag="$1"
-  echo "${tag#v}"
-}
-
-print_bump_usage() {
-  echo "Usage: ./release.sh bump [--dry-run] <major|minor|patch>"
-  echo "       ./release.sh bump [--dry-run] --version vX.Y.Z"
+is_semver_version() {
+  local version="$1"
+  [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
 }
 
 is_semver_tag() {
   local tag="$1"
-  [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+  [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+}
+
+get_latest_tag() {
+  local prefix="${1:-v}"
+  local tag version
+  while IFS= read -r tag; do
+    version="${tag#"$prefix"}"
+    if is_semver_version "$version"; then
+      printf '%s\n' "$tag"
+      return
+    fi
+  done < <(git tag --list "${prefix}*" --sort=-v:refname)
+}
+
+parse_version() {
+  local tag="$1" prefix="${2:-v}"
+  printf '%s\n' "${tag#"$prefix"}"
+}
+
+print_bump_usage() {
+  if [[ "$RELEASE_MODE" == "npm" ]]; then
+    echo "Usage: ./release.sh bump [--dry-run] <major|minor|patch> <package>"
+    echo "       ./release.sh bump [--dry-run] --version vX.Y.Z <package>"
+  else
+    echo "Usage: ./release.sh bump [--dry-run] <major|minor|patch>"
+    echo "       ./release.sh bump [--dry-run] --version vX.Y.Z"
+  fi
 }
 
 bump_version() {
@@ -70,6 +106,98 @@ bump_version() {
       exit 1
       ;;
   esac
+}
+
+compare_versions() {
+  local left="$1" right="$2"
+  local l_major l_minor l_patch r_major r_minor r_patch
+  IFS='.' read -r l_major l_minor l_patch <<< "$left"
+  IFS='.' read -r r_major r_minor r_patch <<< "$right"
+
+  if ((l_major != r_major)); then
+    ((l_major < r_major)) && echo -1 || echo 1
+  elif ((l_minor != r_minor)); then
+    ((l_minor < r_minor)) && echo -1 || echo 1
+  elif ((l_patch != r_patch)); then
+    ((l_patch < r_patch)) && echo -1 || echo 1
+  else
+    echo 0
+  fi
+}
+
+load_release_mode() {
+  local repo_root
+  repo_root=$(get_repo_root)
+  if [[ ! -f "$repo_root/$RELEASE_CONFIG_FILE" ]]; then
+    return
+  fi
+
+  if ! command -v node > /dev/null 2>&1; then
+    echo "$RELEASE_CONFIG_FILE requires Node.js." >&2
+    return 1
+  fi
+
+  IFS=$'\t' read -r RELEASE_MODE RELEASE_BRANCH < <(
+    node - "$repo_root/$RELEASE_CONFIG_FILE" << 'NODE'
+const fs = require("node:fs");
+const config = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+if (config.type !== "npm") {
+  throw new Error(`${process.argv[2]}: type must be \"npm\"`);
+}
+if (!config.branch || typeof config.branch !== "string" || /[\t\n]/.test(config.branch)) {
+  throw new Error(`${process.argv[2]}: branch must be a non-empty string`);
+}
+if (!config.packages || typeof config.packages !== "object" || Array.isArray(config.packages)) {
+  throw new Error(`${process.argv[2]}: packages must be an object`);
+}
+process.stdout.write(`npm\t${config.branch}\n`);
+NODE
+  )
+}
+
+resolve_npm_package() {
+  local package="$1" repo_root output
+  repo_root=$(get_repo_root)
+  output=$(
+    node - "$repo_root/$RELEASE_CONFIG_FILE" "$repo_root" "$package" << 'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const [configPath, root, requested] = process.argv.slice(2);
+const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+const manifest = config.packages[requested];
+if (typeof manifest !== "string" || !manifest) {
+  throw new Error(`Unknown release package: ${requested}`);
+}
+if (manifest.includes("\t") || manifest.includes("\n") || path.isAbsolute(manifest)) {
+  throw new Error(`Invalid manifest path for ${requested}`);
+}
+const absolute = path.resolve(root, manifest);
+const relative = path.relative(root, absolute);
+if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+  throw new Error(`Manifest path escapes the repository: ${manifest}`);
+}
+const packageJson = JSON.parse(fs.readFileSync(absolute, "utf8"));
+if (packageJson.name !== requested) {
+  throw new Error(`Config package ${requested} points to ${packageJson.name || "an unnamed package"}`);
+}
+if (!/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(packageJson.version)) {
+  throw new Error(`${requested} must use a stable MAJOR.MINOR.PATCH version`);
+}
+if (!/^[a-z0-9][a-z0-9._-]*$/.test(requested)) {
+  throw new Error(`${requested} is not supported in package tag names`);
+}
+process.stdout.write([relative.split(path.sep).join("/"), packageJson.name, packageJson.version].join("\t"));
+NODE
+  ) || return 1
+
+  IFS=$'\t' read -r RELEASE_PACKAGE_MANIFEST RELEASE_PACKAGE RELEASE_PACKAGE_VERSION <<< "$output"
+  RELEASE_PACKAGE_PATH="${RELEASE_PACKAGE_MANIFEST%/package.json}"
+  if [[ "$RELEASE_PACKAGE_PATH" == "$RELEASE_PACKAGE_MANIFEST" ]]; then
+    RELEASE_PACKAGE_PATH="."
+  fi
+  RELEASE_TAG_PREFIX="${RELEASE_PACKAGE}-v"
+
+  git check-ref-format "refs/tags/${RELEASE_TAG_PREFIX}0.0.0" > /dev/null
 }
 
 get_repo_root() {
@@ -249,18 +377,27 @@ run_codex_with_progress() {
 
 generate_notes() {
   local prev_tag="$1" new_tag="$2" ai_cli="$3"
+  local package_name="${4:-}" package_path="${5:-}"
 
-  local range
+  local range diff_base
   if [[ -z "$prev_tag" ]]; then
     range="HEAD"
+    diff_base=$(git hash-object -t tree /dev/null)
   else
     range="${prev_tag}..HEAD"
+    diff_base="$prev_tag"
   fi
 
   local commits changed_files diff_stat
-  commits=$(git log "$range" --pretty=format:"- %s%n%b" --no-merges)
-  changed_files=$(git diff "${prev_tag:-$(git rev-list --max-parents=0 HEAD)}..HEAD" --name-status)
-  diff_stat=$(git diff "${prev_tag:-$(git rev-list --max-parents=0 HEAD)}..HEAD" --stat)
+  if [[ -n "$package_path" ]]; then
+    commits=$(git log "$range" --pretty=format:"- %s%n%b" --no-merges -- "$package_path")
+    changed_files=$(git diff "$diff_base" HEAD --name-status -- "$package_path")
+    diff_stat=$(git diff "$diff_base" HEAD --stat -- "$package_path")
+  else
+    commits=$(git log "$range" --pretty=format:"- %s%n%b" --no-merges)
+    changed_files=$(git diff "$diff_base" HEAD --name-status)
+    diff_stat=$(git diff "$diff_base" HEAD --stat)
+  fi
 
   local prompt
   prompt=$(
@@ -318,6 +455,7 @@ Rules:
 - Keep each bullet self-contained and under 40 words when possible.
 - Do not include "Full changelog", contributor lists, file names, or commit hashes.
 
+Package: ${package_name:-"(repository release)"}
 Version: ${new_tag}
 Previous version: ${prev_tag:-"(first release)"}
 
@@ -444,9 +582,106 @@ delete_github_release_for_tag() {
   return 1
 }
 
+require_clean_npm_release_state() {
+  local current_branch
+  git ls-files --error-unmatch "$RELEASE_CONFIG_FILE" "$RELEASE_PACKAGE_MANIFEST" > /dev/null 2>&1 || {
+    echo "$RELEASE_CONFIG_FILE and $RELEASE_PACKAGE_MANIFEST must be tracked." >&2
+    return 1
+  }
+  current_branch=$(git symbolic-ref --quiet --short HEAD) || {
+    echo "npm releases require an attached branch." >&2
+    return 1
+  }
+  if [[ "$current_branch" != "$RELEASE_BRANCH" ]]; then
+    echo "npm releases must run on $RELEASE_BRANCH, not $current_branch." >&2
+    return 1
+  fi
+  if [[ -n "$(git status --porcelain)" ]]; then
+    echo "npm releases require a clean working tree." >&2
+    return 1
+  fi
+}
+
+ensure_remote_tag_absent() {
+  local tag="$1" status=0
+  git ls-remote --exit-code --tags origin "refs/tags/$tag" > /dev/null 2>&1 || status=$?
+  case "$status" in
+    0)
+      echo "Remote tag ${tag} already exists." >&2
+      return 1
+      ;;
+    2) return 0 ;;
+    *)
+      echo "Could not check remote tag $tag." >&2
+      return 1
+      ;;
+  esac
+}
+
+set_package_version() {
+  local manifest="$1" version="$2"
+  node - "$manifest" "$version" << 'NODE'
+const fs = require("node:fs");
+const [manifest, version] = process.argv.slice(2);
+const packageJson = JSON.parse(fs.readFileSync(manifest, "utf8"));
+packageJson.version = version;
+fs.writeFileSync(manifest, `${JSON.stringify(packageJson, null, 2)}\n`);
+NODE
+}
+
+publish_npm_release_tag() {
+  local new_tag="$1" new_version="$2" notes="$3" original_head="$4"
+  local branch local_tag_created=0
+  branch=$(git symbolic-ref --quiet --short HEAD)
+
+  set_package_version "$RELEASE_PACKAGE_MANIFEST" "$new_version"
+  if ! (
+    cd "$RELEASE_PACKAGE_PATH"
+    npm pack --dry-run > /dev/null
+  ); then
+    git restore -- "$RELEASE_PACKAGE_MANIFEST"
+    return 1
+  fi
+
+  local changed_path
+  while IFS= read -r changed_path; do
+    [[ -z "$changed_path" || "$changed_path" == "$RELEASE_PACKAGE_MANIFEST" ]] && continue
+    git restore -- "$RELEASE_PACKAGE_MANIFEST"
+    echo "Package validation changed an unexpected file: $changed_path" >&2
+    return 1
+  done < <({
+    git diff --name-only
+    git ls-files --others --exclude-standard
+  } | sort -u)
+
+  git add "$RELEASE_PACKAGE_MANIFEST"
+  if ! git commit -m "chore: release ${RELEASE_PACKAGE} v${new_version}"; then
+    echo "Release commit failed; the version change remains staged for inspection." >&2
+    return 1
+  fi
+
+  if ! create_release_tag "$new_tag" "$notes"; then
+    git reset --hard "$original_head"
+    return 1
+  fi
+  local_tag_created=1
+
+  if ! git push --atomic origin "HEAD:refs/heads/$branch" "refs/tags/$new_tag"; then
+    if ((local_tag_created)); then
+      git tag -d "$new_tag" > /dev/null 2>&1 || true
+    fi
+    git reset --hard "$original_head"
+    echo "Atomic push failed; restored the local branch and tag state." >&2
+    return 1
+  fi
+
+  echo "Pushed $branch and $new_tag atomically - CI release workflow will start automatically."
+}
+
 cmd_bump() {
   local part=""
   local version_override=""
+  local package_arg=""
   local dry_run=0
 
   if [[ "${1:-}" == "--dry-run" ]]; then
@@ -467,11 +702,6 @@ cmd_bump() {
     fi
     version_override="$2"
     shift 2
-    if [[ $# -gt 0 ]]; then
-      echo "Do not pass major, minor, or patch when using --version." >&2
-      print_bump_usage
-      exit 1
-    fi
   else
     part="$1"
     if [[ ! "$part" =~ ^(major|minor|patch)$ ]]; then
@@ -479,15 +709,23 @@ cmd_bump() {
       exit 1
     fi
     shift
-    if [[ $# -gt 0 ]]; then
-      if [[ "$1" == "--version" ]]; then
-        echo "Do not pass major, minor, or patch when using --version." >&2
-      else
-        echo "Unknown argument for bump: $1" >&2
-      fi
+  fi
+
+  if [[ "$RELEASE_MODE" == "npm" ]]; then
+    if [[ $# -ne 1 ]]; then
       print_bump_usage
       exit 1
     fi
+    package_arg="$1"
+    resolve_npm_package "$package_arg"
+  elif [[ $# -gt 0 ]]; then
+    if [[ "$1" == "--version" ]]; then
+      echo "Do not pass major, minor, or patch when using --version." >&2
+    else
+      echo "Unknown argument for bump: $1" >&2
+    fi
+    print_bump_usage
+    exit 1
   fi
 
   if [[ -n "$version_override" ]] && ! is_semver_tag "$version_override"; then
@@ -496,23 +734,44 @@ cmd_bump() {
     exit 1
   fi
 
-  local latest current new_tag
-  latest=$(get_latest_tag)
-  if [[ -z "$latest" ]]; then
+  local latest current new_version new_tag
+  latest=$(get_latest_tag "$RELEASE_TAG_PREFIX")
+  if [[ "$RELEASE_MODE" == "npm" ]]; then
+    current="$RELEASE_PACKAGE_VERSION"
+    if [[ -n "$latest" ]] && [[ "$(parse_version "$latest" "$RELEASE_TAG_PREFIX")" != "$current" ]]; then
+      echo "$RELEASE_PACKAGE manifest version $current does not match latest tag $latest." >&2
+      exit 1
+    fi
+  elif [[ -z "$latest" ]]; then
     current="0.0.0"
   else
     current=$(parse_version "$latest")
   fi
 
   if [[ -n "$version_override" ]]; then
-    new_tag="$version_override"
+    new_version="${version_override#v}"
   else
-    new_tag="v$(bump_version "$current" "$part")"
+    new_version=$(bump_version "$current" "$part")
+  fi
+  new_tag="${RELEASE_TAG_PREFIX}${new_version}"
+
+  local version_comparison
+  version_comparison=$(compare_versions "$new_version" "$current")
+  if [[ "$RELEASE_MODE" == "npm" ]] && ((version_comparison <= 0)); then
+    echo "New version $new_version must be greater than $current." >&2
+    exit 1
   fi
 
   if git rev-parse -q --verify "refs/tags/${new_tag}" > /dev/null 2>&1; then
     echo "Tag ${new_tag} already exists." >&2
     exit 1
+  fi
+  if [[ "$RELEASE_MODE" == "npm" ]]; then
+    ensure_remote_tag_absent "$new_tag"
+  fi
+
+  if [[ "$RELEASE_MODE" == "npm" ]] && ((dry_run == 0)); then
+    require_clean_npm_release_state
   fi
 
   echo "Current version: ${current}"
@@ -521,6 +780,9 @@ cmd_bump() {
   else
     echo "New version:     ${new_tag}"
   fi
+  if [[ "$RELEASE_MODE" == "npm" ]]; then
+    echo "Package:         ${RELEASE_PACKAGE} (${RELEASE_PACKAGE_PATH})"
+  fi
   echo ""
 
   local ai_cli
@@ -528,7 +790,7 @@ cmd_bump() {
 
   echo "Generating release notes with ${ai_cli}..."
   local notes
-  notes=$(generate_notes "$latest" "$new_tag" "$ai_cli")
+  notes=$(generate_notes "$latest" "$new_tag" "$ai_cli" "$RELEASE_PACKAGE" "$RELEASE_PACKAGE_PATH")
   echo ""
   echo "--- Release Notes ---"
   echo "$notes"
@@ -536,19 +798,37 @@ cmd_bump() {
   echo ""
 
   if ((dry_run)); then
-    echo "Dry run complete. No local tag was created or pushed."
+    if [[ "$RELEASE_MODE" == "npm" ]]; then
+      echo "Dry run complete. No package version, commit, or tag was changed."
+    else
+      echo "Dry run complete. No local tag was created or pushed."
+    fi
     return
   fi
 
-  read -rp "Create and push tag ${new_tag}? [Y/n] " confirm
+  local original_head
+  original_head=$(git rev-parse HEAD)
+  read -rp "Create and push ${new_tag}? [Y/n] " confirm
   if [[ "$confirm" == [nN] ]]; then
     echo "Aborted."
     exit 0
   fi
 
-  create_release_tag "$new_tag" "$notes"
-  git push origin "${new_tag}"
-  echo "Pushed ${new_tag} - CI release workflow will start automatically."
+  if [[ "$RELEASE_MODE" == "npm" ]]; then
+    if [[ "$(git rev-parse HEAD)" != "$original_head" ]]; then
+      echo "HEAD changed while preparing the release; start again." >&2
+      exit 1
+    fi
+    require_clean_npm_release_state
+    publish_npm_release_tag "$new_tag" "$new_version" "$notes" "$original_head"
+  else
+    create_release_tag "$new_tag" "$notes"
+    if ! git push origin "${new_tag}"; then
+      git tag -d "$new_tag" > /dev/null 2>&1 || true
+      return 1
+    fi
+    echo "Pushed ${new_tag} - CI release workflow will start automatically."
+  fi
 }
 
 cmd_retag() {
@@ -556,6 +836,12 @@ cmd_retag() {
   if [[ "${1:-}" == "--dry-run" ]]; then
     dry_run=1
     shift
+  fi
+
+  if [[ "$RELEASE_MODE" == "npm" ]]; then
+    echo "retag is disabled for npm packages because published versions are immutable." >&2
+    echo "Create a new patch release instead." >&2
+    exit 1
   fi
 
   local latest
@@ -645,12 +931,27 @@ cmd_retag() {
 }
 
 cmd_latest() {
+  if [[ "$RELEASE_MODE" == "npm" ]]; then
+    if [[ $# -ne 1 ]]; then
+      echo "Usage: ./release.sh latest <package>" >&2
+      exit 1
+    fi
+    resolve_npm_package "$1"
+  elif [[ $# -gt 0 ]]; then
+    echo "latest does not accept arguments without $RELEASE_CONFIG_FILE." >&2
+    exit 1
+  fi
+
   local latest
-  latest=$(get_latest_tag)
+  latest=$(get_latest_tag "$RELEASE_TAG_PREFIX")
   if [[ -z "$latest" ]]; then
-    echo "No version tags found."
+    if [[ "$RELEASE_MODE" == "npm" ]]; then
+      echo "No version tags found for $RELEASE_PACKAGE."
+    else
+      echo "No version tags found."
+    fi
   else
-    echo "$latest ($(parse_version "$latest"))"
+    echo "$latest ($(parse_version "$latest" "$RELEASE_TAG_PREFIX"))"
   fi
 }
 
@@ -674,6 +975,8 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+load_release_mode
 
 [[ $# -lt 1 ]] && usage 1
 

@@ -25,13 +25,17 @@ Canonical repository URL: `https://github.com/sharaf-nassar/release-me`
   dependencies unless the user explicitly asks for them.
 - Keep the script generic. Do not add project-specific release logic,
   app-specific heuristics, CI-vendor assumptions, or downstream branding.
-- Treat semver tags as the contract. `get_latest_tag` should continue to look at
-  `vMAJOR.MINOR.PATCH` tags only.
+- Repositories without `.release-me.json` keep `vMAJOR.MINOR.PATCH` tags and the
+  original command grammar. An npm-style config opts into package arguments,
+  package-scoped notes, manifest version commits, and
+  `<package>-vMAJOR.MINOR.PATCH` tags.
 - `bump --version` is an exact semver-tag override and remains scoped to
   `bump`. It must not require or accept `major`, `minor`, or `patch`. Do not
   extend it to `retag` unless the user explicitly requests it.
-- `retag` is latest-only by design. Do not reintroduce arbitrary-tag retagging
-  unless the user explicitly requests that behavior.
+- `retag` is latest-only by design for repository releases. It is disabled in
+  npm package mode because registry versions cannot be republished or moved.
+  Do not reintroduce arbitrary-tag retagging unless the user explicitly
+  requests that behavior.
 - `retag` must delete the existing GitHub Release for the latest tag before
   deleting and re-pushing the remote tag. Keep this separate from tag cleanup so
   release deletion cannot accidentally replace the explicit git tag flow.
@@ -53,7 +57,8 @@ Canonical repository URL: `https://github.com/sharaf-nassar/release-me`
 - Re-read `release.sh` before editing if the file may have changed during the
   session.
 - After changing `release.sh`, run at least `bash -n release.sh`. If behavior
-  changed, also run the narrowest command that proves the new behavior.
+  changed, run `./test-dry-run.sh`, which covers both legacy dry runs and the
+  package release commit/tag/atomic-push path.
 - After changing hook config or repo-wide text/style rules, run
   `pre-commit run --all-files`.
 - Do not claim the submodule workflow works unless you validated it from a

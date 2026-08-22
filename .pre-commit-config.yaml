@@ -50,7 +50,7 @@ repos:
         name: bash syntax check
         entry: bash -n
         language: system
-        files: ^release\.sh$
+        files: ^(?:release|test-dry-run)\.sh$
 
   - repo: meta
     hooks:
