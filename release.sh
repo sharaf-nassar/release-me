@@ -602,6 +602,12 @@ require_clean_npm_release_state() {
   fi
 }
 
+remote_tag_absent() {
+  local tag="$1" status=0
+  git ls-remote --exit-code --tags origin "refs/tags/$tag" > /dev/null 2>&1 || status=$?
+  [[ "$status" -eq 2 ]]
+}
+
 ensure_remote_tag_absent() {
   local tag="$1" status=0
   git ls-remote --exit-code --tags origin "refs/tags/$tag" > /dev/null 2>&1 || status=$?
@@ -655,7 +661,9 @@ publish_npm_release_tag() {
   } | sort -u)
 
   git add "$RELEASE_PACKAGE_MANIFEST"
-  if ! git commit -m "chore: release ${RELEASE_PACKAGE} v${new_version}"; then
+  if git diff --cached --quiet -- "$RELEASE_PACKAGE_MANIFEST"; then
+    echo "Manifest already records ${new_version}; tagging HEAD without a new release commit."
+  elif ! git commit -m "chore: release ${RELEASE_PACKAGE} v${new_version}"; then
     echo "Release commit failed; the version change remains staged for inspection." >&2
     return 1
   fi
@@ -738,9 +746,27 @@ cmd_bump() {
   latest=$(get_latest_tag "$RELEASE_TAG_PREFIX")
   if [[ "$RELEASE_MODE" == "npm" ]]; then
     current="$RELEASE_PACKAGE_VERSION"
-    if [[ -n "$latest" ]] && [[ "$(parse_version "$latest" "$RELEASE_TAG_PREFIX")" != "$current" ]]; then
-      echo "$RELEASE_PACKAGE manifest version $current does not match latest tag $latest." >&2
-      exit 1
+    if [[ -n "$latest" ]]; then
+      local tag_version
+      tag_version=$(parse_version "$latest" "$RELEASE_TAG_PREFIX")
+      if [[ "$tag_version" != "$current" ]]; then
+        # A manifest ahead of the latest tag with no local or remote tag of
+        # its own is the leftover of an interrupted bump: the version write
+        # happened but the release commit, tag, or push did not finish.
+        # Rebase the bump on the tag and let it own the version write again.
+        if (($(compare_versions "$current" "$tag_version") > 0)) &&
+          ! git rev-parse -q --verify "refs/tags/${RELEASE_TAG_PREFIX}${current}" > /dev/null 2>&1 &&
+          remote_tag_absent "${RELEASE_TAG_PREFIX}${current}"; then
+          echo "Manifest version $current was never tagged; recovering the interrupted release from baseline $latest."
+          if ((dry_run == 0)); then
+            git restore --source=HEAD --staged --worktree -- "$RELEASE_PACKAGE_MANIFEST"
+          fi
+          current="$tag_version"
+        else
+          echo "$RELEASE_PACKAGE manifest version $current does not match latest tag $latest." >&2
+          exit 1
+        fi
+      fi
     fi
   elif [[ -z "$latest" ]]; then
     current="0.0.0"

@@ -152,4 +152,46 @@ printf '\n' | (cd "$consumer" && PATH="$mock_bin:$PATH" \
 [[ -e "$REMOTE_CALLED_FILE" ]]
 [[ ! -e "$GH_CALLED_FILE" ]]
 
+# Interrupted-release recovery: a manifest bumped past the latest tag with
+# no tag of its own must downrev and rerelease instead of hard-failing.
+node -e "const f='$consumer/packages/demo/package.json',j=require(f);j.version='1.2.2';require('fs').writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
+git -C "$consumer" add packages/demo/package.json
+
+recover_dry=$(cd "$consumer" && PATH="$mock_bin:$PATH" \
+  ./tools/release-me/release.sh --ai codex bump --dry-run patch demo)
+[[ "$recover_dry" == *"recovering the interrupted release from baseline demo-v1.2.1"* ]]
+[[ "$recover_dry" == *"New version:     demo-v1.2.2"* ]]
+[[ "$(node -p "require('$consumer/packages/demo/package.json').version")" == "1.2.2" ]]
+
+printf '\n' | (cd "$consumer" && PATH="$mock_bin:$PATH" \
+  ./tools/release-me/release.sh --ai codex bump patch demo > /dev/null)
+[[ "$(node -p "require('$consumer/packages/demo/package.json').version")" == "1.2.2" ]]
+[[ "$(git -C "$consumer" log -1 --pretty=%s)" == "chore: release demo v1.2.2" ]]
+[[ "$(git -C "$consumer" rev-parse 'demo-v1.2.2^{commit}')" == "$(git --git-dir="$origin" rev-parse 'demo-v1.2.2^{commit}')" ]]
+
+# Committed-ahead leftover: the stray version is already in HEAD, so the
+# recovered release tags HEAD without an empty release commit.
+node -e "const f='$consumer/packages/demo/package.json',j=require(f);j.version='1.2.3';require('fs').writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
+git -C "$consumer" add packages/demo/package.json
+git -C "$consumer" commit --quiet -m "stray version bump"
+
+recover_real=$(printf '\n' | (cd "$consumer" && PATH="$mock_bin:$PATH" \
+  ./tools/release-me/release.sh --ai codex bump patch demo))
+[[ "$recover_real" == *"tagging HEAD without a new release commit"* ]]
+[[ "$(git -C "$consumer" log -1 --pretty=%s)" == "stray version bump" ]]
+[[ "$(git -C "$consumer" cat-file -t demo-v1.2.3)" == "tag" ]]
+[[ "$(git -C "$consumer" rev-parse 'demo-v1.2.3^{commit}')" == "$(git --git-dir="$origin" rev-parse 'demo-v1.2.3^{commit}')" ]]
+
+# A manifest BEHIND the latest tag is not an interrupted release and must
+# keep the hard mismatch error.
+node -e "const f='$consumer/packages/demo/package.json',j=require(f);j.version='1.2.2';require('fs').writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
+git -C "$consumer" add packages/demo/package.json
+git -C "$consumer" commit --quiet -m "downgrade manifest"
+if behind_output=$(cd "$consumer" && PATH="$mock_bin:$PATH" \
+  ./tools/release-me/release.sh --ai codex bump --dry-run patch demo 2>&1); then
+  exit 1
+else
+  [[ "$behind_output" == *"does not match latest tag demo-v1.2.3"* ]]
+fi
+
 echo "dry-run and npm release checks passed"
