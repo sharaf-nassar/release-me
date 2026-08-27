@@ -4,6 +4,16 @@ set -euo pipefail
 CODEX_PROGRESS_LINES=20
 CODEX_PROGRESS_SCAN_LINES=200
 CODEX_PROGRESS_INTERVAL_SECONDS=0.1
+PI_NOTES_POLL_INTERVAL_SECONDS=0.2
+PI_NOTES_STABLE_SECONDS=10
+RELEASE_DIFF_MAX_CHARS=200000
+
+# Models for release notes. When pi is installed the notes always run through
+# pi and --ai selects the model: codex/auto -> PI_CODEX_MODEL, claude ->
+# CLAUDE_MODEL. The claude CLI fallback uses CLAUDE_MODEL too; the codex CLI
+# fallback keeps its own configured default model.
+PI_CODEX_MODEL="gpt-5.6-sol"
+CLAUDE_MODEL="claude-opus-4-7"
 
 usage() {
   local exit_code="${1:-1}"
@@ -13,12 +23,17 @@ Usage: ./release.sh [--ai auto|codex|claude] <command> [args]
 Options:
   --ai <auto|codex|claude>  Select the CLI used for release notes (default: auto)
   Codex uses the executable from PATH and its normal user/project configuration.
+  When pi is installed, notes always run through pi and --ai selects the model
+  instead of the harness: codex/auto use gpt-5.6-sol, claude uses
+  claude-opus-4-7.
 
 Commands without .release-me.json:
   bump [--dry-run] <major|minor|patch>
                              Create and push a new version tag
   bump [--dry-run] --version vX.Y.Z
                              Create and push an explicit version tag
+  bump [--dry-run] auto      Let the AI decide patch/minor/major from the
+                             changes, then confirm and release
   retag [--dry-run]          Delete the GitHub release and replace the latest tag
   latest                     Show the latest version tag
 
@@ -27,16 +42,22 @@ Commands with npm-style .release-me.json:
                              Commit a package version and push its tag
   bump [--dry-run] --version vX.Y.Z <package>
                              Commit and tag an explicit package version
+  bump [--dry-run] auto      Decide a bump per package and confirm each
+                             changed package before releasing it
   latest <package>           Show the latest package version tag
+
+Release confirmation prompts accept Y (accept), n (decline), or an override
+bump level: major, minor, or patch.
 
 Examples:
   ./release.sh --ai auto bump patch   # Prefer Codex, fall back to Claude
-  ./release.sh --ai claude bump patch # Force Claude for release notes
+  ./release.sh --ai claude bump patch # Force the Claude model for notes
   ./release.sh bump patch             # v0.2.1 -> v0.2.2
   ./release.sh bump --dry-run patch   # Generate notes without creating a tag
   ./release.sh bump --version v1.2.3  # Use an explicit tag
   ./release.sh bump minor             # v0.2.1 -> v0.3.0
   ./release.sh bump major             # v0.2.1 -> v1.0.0
+  ./release.sh bump auto              # AI decides each bump; confirm/override per package
   ./release.sh retag                  # Delete the GitHub release and re-point latest tag
   ./release.sh retag --dry-run        # Regenerate notes without changing the release or tag
   ./release.sh latest                 # Print latest tag
@@ -54,6 +75,11 @@ RELEASE_PACKAGE_MANIFEST=""
 RELEASE_PACKAGE_PATH=""
 RELEASE_PACKAGE_VERSION=""
 RELEASE_TAG_PREFIX="v"
+
+AUTO_BUMP_LEVEL=""
+AUTO_BUMP_NOTES=""
+AUTO_RELEASED=0
+AUTO_SKIPPED=0
 
 is_semver_version() {
   local version="$1"
@@ -90,6 +116,7 @@ print_bump_usage() {
     echo "Usage: ./release.sh bump [--dry-run] <major|minor|patch>"
     echo "       ./release.sh bump [--dry-run] --version vX.Y.Z"
   fi
+  echo "       ./release.sh bump [--dry-run] auto"
 }
 
 bump_version() {
@@ -375,39 +402,134 @@ run_codex_with_progress() {
   return "$status"
 }
 
-generate_notes() {
-  local prev_tag="$1" new_tag="$2" ai_cli="$3"
-  local package_name="${4:-}" package_path="${5:-}"
+run_pi_prompt() {
+  local model="$1" prompt="$2" output_file="$3"
+  local prompt_file pid status size last_size stable_since now
 
-  local range diff_base
-  if [[ -z "$prev_tag" ]]; then
-    range="HEAD"
-    diff_base=$(git hash-object -t tree /dev/null)
-  else
-    range="${prev_tag}..HEAD"
-    diff_base="$prev_tag"
+  prompt_file=$(mktemp)
+  printf '%s\n' "$prompt" > "$prompt_file"
+
+  pi --print --no-session --model "$model" < "$prompt_file" > "$output_file" 2> /dev/null &
+  pid=$!
+
+  trap 'kill "$pid" 2>/dev/null || true; rm -f "$prompt_file"; exit 130' INT TERM
+
+  # ponytail: some extension setups keep pi alive after the -p response is
+  # written; accept output that stayed non-empty and stable for a few seconds.
+  last_size=0
+  stable_since=$(date +%s)
+  status=0
+  while kill -0 "$pid" 2> /dev/null; do
+    sleep "$PI_NOTES_POLL_INTERVAL_SECONDS"
+    size=$(wc -c < "$output_file" 2> /dev/null || echo 0)
+    now=$(date +%s)
+    if ((size != last_size)); then
+      last_size=$size
+      stable_since=$now
+    elif ((size > 0 && now - stable_since >= PI_NOTES_STABLE_SECONDS)); then
+      kill "$pid" 2> /dev/null || true
+      break
+    fi
+  done
+
+  wait "$pid" 2> /dev/null || status=$?
+  if ((last_size > 0)); then
+    status=0
   fi
 
-  local commits changed_files diff_stat
+  trap - INT TERM
+  rm -f "$prompt_file"
+  return "$status"
+}
+
+release_log_range() {
+  local prev_tag="$1"
+  if [[ -z "$prev_tag" ]]; then
+    echo "HEAD"
+  else
+    echo "${prev_tag}..HEAD"
+  fi
+}
+
+release_diff_base() {
+  local prev_tag="$1"
+  if [[ -z "$prev_tag" ]]; then
+    git hash-object -t tree /dev/null
+  else
+    echo "$prev_tag"
+  fi
+}
+
+has_release_commits() {
+  local prev_tag="$1" package_path="${2:-}"
+  local range
+  range=$(release_log_range "$prev_tag")
+  if [[ -n "$package_path" ]]; then
+    [[ -n "$(git rev-list -n 1 --no-merges "$range" -- "$package_path")" ]]
+  else
+    [[ -n "$(git rev-list -n 1 --no-merges "$range")" ]]
+  fi
+}
+
+build_release_context() {
+  local prev_tag="$1" package_path="${2:-}"
+  local range diff_base commits changed_files diff_stat diff_patch
+  range=$(release_log_range "$prev_tag")
+  diff_base=$(release_diff_base "$prev_tag")
+
+  # Lock files stay visible in the file lists but are excluded from the
+  # patch so they cannot crowd real changes out of the size cap.
+  local -a patch_excludes=(
+    ":(glob,exclude)**/package-lock.json"
+    ":(glob,exclude)**/pnpm-lock.yaml"
+    ":(glob,exclude)**/*.lock"
+  )
+
   if [[ -n "$package_path" ]]; then
     commits=$(git log "$range" --pretty=format:"- %s%n%b" --no-merges -- "$package_path")
     changed_files=$(git diff "$diff_base" HEAD --name-status -- "$package_path")
     diff_stat=$(git diff "$diff_base" HEAD --stat -- "$package_path")
+    diff_patch=$(git diff "$diff_base" HEAD -- "$package_path" "${patch_excludes[@]}")
   else
     commits=$(git log "$range" --pretty=format:"- %s%n%b" --no-merges)
     changed_files=$(git diff "$diff_base" HEAD --name-status)
     diff_stat=$(git diff "$diff_base" HEAD --stat)
+    diff_patch=$(git diff "$diff_base" HEAD -- . "${patch_excludes[@]}")
   fi
 
-  local prompt
-  prompt=$(
-    cat << PROMPT
-You are writing customer-facing GitHub release notes for this repo.
+  if ((${#diff_patch} > RELEASE_DIFF_MAX_CHARS)); then
+    diff_patch="${diff_patch:0:RELEASE_DIFF_MAX_CHARS}
+(diff truncated at ${RELEASE_DIFF_MAX_CHARS} characters; the file lists above cover the rest)"
+  fi
 
+  cat << CONTEXT
+Commit details:
+${commits}
+
+Changed files:
+${changed_files}
+
+Files changed:
+${diff_stat}
+
+Diff (lock files excluded):
+${diff_patch}
+CONTEXT
+}
+
+# Shared release-notes instructions and change context. Callers prepend their
+# own opening instructions (plain notes vs bump decision plus notes).
+build_notes_rules() {
+  local version_display="$1" forbidden_tag="$2" prev_tag="$3"
+  local package_name="$4" context="$5"
+
+  cat << PROMPT
 Write for people deciding whether to use or upgrade to this release. Make the
 release sound useful and easy to scan without hype, filler, or implementation
 jargon. Translate code changes into product value. If the source material does
-not prove a claim, do not invent it.
+not prove a claim, do not invent it. The diff is the source of truth: cover
+meaningful changes it shows even when no commit message mentions them, and
+trust it over any commit message it contradicts.
 
 Prioritize:
 1. New user-visible capabilities and workflows.
@@ -422,7 +544,7 @@ like "various fixes and improvements".
 Use this Markdown structure, omitting sections that have no meaningful items.
 Do not include a top-level title, heading, or version line at the start of the
 notes — begin directly with the description paragraph below. Do not mention the
-version tag (e.g., "${new_tag}", "v1.2.3", or any "vX.Y.Z" string) anywhere in
+version tag (e.g., "${forbidden_tag}", "v1.2.3", or any "vX.Y.Z" string) anywhere in
 the opening paragraph; the release title already shows it. The first sentence
 must start with the change itself, not the version.
 
@@ -456,36 +578,43 @@ Rules:
 - Do not include "Full changelog", contributor lists, file names, or commit hashes.
 
 Package: ${package_name:-"(repository release)"}
-Version: ${new_tag}
+Version: ${version_display}
 Previous version: ${prev_tag:-"(first release)"}
 
-Commit details:
-${commits}
-
-Changed files:
-${changed_files}
-
-Files changed:
-${diff_stat}
+${context}
 PROMPT
-  )
+}
 
-  local notes
+run_ai_prompt() {
+  local ai_cli="$1" prompt="$2"
+  local output output_file
+
   case "$ai_cli" in
-    codex)
-      local output_file
+    pi:*)
       output_file=$(mktemp)
-      if run_codex_with_progress "$prompt" "$output_file"; then
-        notes=$(cat "$output_file")
+      if run_pi_prompt "${ai_cli#pi:}" "$prompt" "$output_file"; then
+        # Extensions may append hidden session metadata to the response.
+        output=$(sed '/^<session_title>.*<\/session_title>[[:space:]]*$/d' "$output_file")
       else
         rm -f "$output_file"
-        echo "Failed to generate release notes with Codex." >&2
+        echo "Failed to generate release output with pi." >&2
+        return 1
+      fi
+      rm -f "$output_file"
+      ;;
+    codex)
+      output_file=$(mktemp)
+      if run_codex_with_progress "$prompt" "$output_file"; then
+        output=$(cat "$output_file")
+      else
+        rm -f "$output_file"
+        echo "Failed to generate release output with Codex." >&2
         return 1
       fi
       rm -f "$output_file"
       ;;
     claude)
-      notes=$(claude -p --model claude-opus-4-7 --output-format text --no-session-persistence "$prompt" 2> /dev/null)
+      output=$(claude -p --model "$CLAUDE_MODEL" --output-format text --no-session-persistence "$prompt" 2> /dev/null)
       ;;
     *)
       echo "Unknown AI CLI: $ai_cli" >&2
@@ -493,12 +622,86 @@ PROMPT
       ;;
   esac
 
-  if [[ -z "${notes//[[:space:]]/}" ]]; then
-    echo "Release notes generation returned no output with ${ai_cli}." >&2
+  if [[ -z "${output//[[:space:]]/}" ]]; then
+    echo "AI generation returned no output with ${ai_cli}." >&2
     return 1
   fi
 
-  echo "$notes"
+  printf '%s\n' "$output"
+}
+
+generate_notes() {
+  local prev_tag="$1" new_tag="$2" ai_cli="$3"
+  local package_name="${4:-}" package_path="${5:-}"
+
+  local context prompt
+  context=$(build_release_context "$prev_tag" "$package_path")
+  prompt=$(
+    cat << PROMPT
+You are writing customer-facing GitHub release notes for this repo.
+
+$(build_notes_rules "$new_tag" "$new_tag" "$prev_tag" "$package_name" "$context")
+PROMPT
+  )
+
+  run_ai_prompt "$ai_cli" "$prompt"
+}
+
+# Single AI pass: decide the semver bump level from the change range and write
+# the release notes for it. Sets AUTO_BUMP_LEVEL and AUTO_BUMP_NOTES.
+decide_bump_and_notes() {
+  local prev_tag="$1" current="$2" ai_cli="$3"
+  local package_name="${4:-}" package_path="${5:-}"
+
+  local patch_tag minor_tag major_tag
+  patch_tag="${RELEASE_TAG_PREFIX}$(bump_version "$current" patch)"
+  minor_tag="${RELEASE_TAG_PREFIX}$(bump_version "$current" minor)"
+  major_tag="${RELEASE_TAG_PREFIX}$(bump_version "$current" major)"
+
+  local context prompt
+  context=$(build_release_context "$prev_tag" "$package_path")
+  prompt=$(
+    cat << PROMPT
+You are deciding the semantic version bump for the next release of this repo
+and writing its customer-facing GitHub release notes in the same pass.
+
+Bump decision rules:
+- major: any breaking or incompatible change — removed or renamed commands,
+  flags, APIs, or configuration; changed defaults or output that break
+  existing usage; required migrations.
+- minor: new backwards-compatible user-visible features or capabilities.
+- patch: bug fixes, reliability or performance work, docs, and internal-only
+  changes.
+Pick the highest level that any change in the range justifies. Judge from
+the diff itself as well as the commit messages; commits may omit or
+under-describe changes.
+
+Output format (exact):
+- Line 1: exactly "bump: patch", "bump: minor", or "bump: major".
+- Line 2: blank.
+- Line 3 onward: the release notes, following every rule below.
+
+$(build_notes_rules "chosen by your bump line (patch=${patch_tag}, minor=${minor_tag}, major=${major_tag})" "$patch_tag" "$prev_tag" "$package_name" "$context")
+PROMPT
+  )
+
+  local raw first_line
+  raw=$(run_ai_prompt "$ai_cli" "$prompt") || return 1
+
+  first_line=$(awk 'NF { print; exit }' <<< "$raw")
+  if [[ "$first_line" =~ ^[[:space:]]*bump:[[:space:]]*(patch|minor|major)[[:space:]]*$ ]]; then
+    AUTO_BUMP_LEVEL="${BASH_REMATCH[1]}"
+  else
+    echo 'Could not parse a bump decision; expected a first line like "bump: patch" but got:' >&2
+    printf '%s\n' "$first_line" >&2
+    return 1
+  fi
+
+  AUTO_BUMP_NOTES=$(awk 'found { print } !found && NF { found = 1 }' <<< "$raw" | sed '/./,$!d')
+  if [[ -z "${AUTO_BUMP_NOTES//[[:space:]]/}" ]]; then
+    echo "The AI returned a bump decision but no release notes." >&2
+    return 1
+  fi
 }
 
 create_release_tag() {
@@ -525,26 +728,39 @@ resolve_ai_cli() {
   local preference="${1:-auto}"
 
   case "$preference" in
+    auto | codex | claude) ;;
+    *)
+      echo "Invalid value for --ai: $preference" >&2
+      return 1
+      ;;
+  esac
+
+  if command -v pi > /dev/null 2>&1; then
+    if [[ "$preference" == "claude" ]]; then
+      echo "pi:${CLAUDE_MODEL}"
+    else
+      echo "pi:${PI_CODEX_MODEL}"
+    fi
+    return 0
+  fi
+
+  case "$preference" in
     auto)
       if command -v codex > /dev/null 2>&1; then
         echo "codex"
       elif command -v claude > /dev/null 2>&1; then
         echo "claude"
       else
-        echo "Neither codex nor claude is installed. Install one of them or use --ai to choose an available CLI." >&2
+        echo "None of pi, codex, or claude is installed. Install one of them or use --ai to choose an available CLI." >&2
         return 1
       fi
       ;;
-    codex | claude)
+    *)
       if ! command -v "$preference" > /dev/null 2>&1; then
         echo "Requested AI CLI '$preference' is not installed." >&2
         return 1
       fi
       echo "$preference"
-      ;;
-    *)
-      echo "Invalid value for --ai: $preference" >&2
-      return 1
       ;;
   esac
 }
@@ -686,6 +902,212 @@ publish_npm_release_tag() {
   echo "Pushed $branch and $new_tag atomically - CI release workflow will start automatically."
 }
 
+resolve_current_version() {
+  local latest="$1" dry_run="$2"
+  local current
+
+  if [[ "$RELEASE_MODE" == "npm" ]]; then
+    current="$RELEASE_PACKAGE_VERSION"
+    if [[ -n "$latest" ]]; then
+      local tag_version
+      tag_version=$(parse_version "$latest" "$RELEASE_TAG_PREFIX")
+      if [[ "$tag_version" != "$current" ]]; then
+        # A manifest ahead of the latest tag with no local or remote tag of
+        # its own is the leftover of an interrupted bump: the version write
+        # happened but the release commit, tag, or push did not finish.
+        # Rebase the bump on the tag and let it own the version write again.
+        if (($(compare_versions "$current" "$tag_version") > 0)) &&
+          ! git rev-parse -q --verify "refs/tags/${RELEASE_TAG_PREFIX}${current}" > /dev/null 2>&1 &&
+          remote_tag_absent "${RELEASE_TAG_PREFIX}${current}"; then
+          echo "Manifest version $current was never tagged; recovering the interrupted release from baseline $latest." >&2
+          if ((dry_run == 0)); then
+            git restore --source=HEAD --staged --worktree -- "$RELEASE_PACKAGE_MANIFEST"
+          fi
+          current="$tag_version"
+        else
+          echo "$RELEASE_PACKAGE manifest version $current does not match latest tag $latest." >&2
+          return 1
+        fi
+      fi
+    fi
+  elif [[ -z "$latest" ]]; then
+    current="0.0.0"
+  else
+    current=$(parse_version "$latest")
+  fi
+
+  printf '%s\n' "$current"
+}
+
+list_release_packages() {
+  local repo_root
+  repo_root=$(get_repo_root)
+  node - "$repo_root/$RELEASE_CONFIG_FILE" << 'NODE'
+const fs = require("node:fs");
+const config = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+for (const name of Object.keys(config.packages)) {
+  process.stdout.write(`${name}\n`);
+}
+NODE
+}
+
+ensure_new_tag_available() {
+  local new_tag="$1"
+  if git rev-parse -q --verify "refs/tags/${new_tag}" > /dev/null 2>&1; then
+    echo "Tag ${new_tag} already exists." >&2
+    return 1
+  fi
+  if [[ "$RELEASE_MODE" == "npm" ]]; then
+    ensure_remote_tag_absent "$new_tag"
+  fi
+}
+
+# Confirm a release at the terminal. Prints an override level (major, minor,
+# or patch) or an empty string to keep the proposal; returns 1 on decline.
+prompt_release_confirmation() {
+  local new_tag="$1" prompt_prefix="${2:-}"
+  local answer
+  while true; do
+    if ! read -rp "${prompt_prefix}Create and push ${new_tag}? [Y/n/major/minor/patch] " answer; then
+      return 1
+    fi
+    case "$answer" in
+      "" | [yY])
+        echo ""
+        return 0
+        ;;
+      [nN])
+        return 1
+        ;;
+      major | minor | patch)
+        echo "$answer"
+        return 0
+        ;;
+      *)
+        echo "Answer Y to accept, n to decline, or major/minor/patch to override." >&2
+        ;;
+    esac
+  done
+}
+
+# Decide and release one target: the whole repository in legacy mode, or one
+# configured package in npm mode. Skips targets with no commits in range and
+# confirms every decided release at a prompt that can accept, decline the
+# target, or override the bump level.
+auto_release_one() {
+  local ai_cli="$1" dry_run="$2" package="${3:-}"
+
+  if [[ "$RELEASE_MODE" == "npm" ]]; then
+    resolve_npm_package "$package"
+  fi
+
+  local target="${RELEASE_PACKAGE:-repository}"
+  local latest current
+  latest=$(get_latest_tag "$RELEASE_TAG_PREFIX")
+  current=$(resolve_current_version "$latest" "$dry_run")
+
+  if ! has_release_commits "$latest" "$RELEASE_PACKAGE_PATH"; then
+    echo "${target}: no changes since ${latest:-the first commit}; skipping."
+    AUTO_SKIPPED=$((AUTO_SKIPPED + 1))
+    return 0
+  fi
+
+  if [[ "$RELEASE_MODE" == "npm" ]] && ((dry_run == 0)); then
+    require_clean_npm_release_state
+  fi
+
+  echo "${target}: deciding the bump and generating release notes with ${ai_cli}..."
+  decide_bump_and_notes "$latest" "$current" "$ai_cli" "$RELEASE_PACKAGE" "$RELEASE_PACKAGE_PATH"
+
+  local new_version new_tag
+  new_version=$(bump_version "$current" "$AUTO_BUMP_LEVEL")
+  new_tag="${RELEASE_TAG_PREFIX}${new_version}"
+
+  ensure_new_tag_available "$new_tag"
+
+  echo ""
+  echo "Current version: ${current}"
+  echo "Decision:        ${AUTO_BUMP_LEVEL} -> ${new_tag}"
+  echo ""
+  echo "--- Release Notes ---"
+  echo "$AUTO_BUMP_NOTES"
+  echo "---------------------"
+  echo ""
+
+  if ((dry_run)); then
+    echo "Dry run: ${new_tag} (${AUTO_BUMP_LEVEL} bump) would be released."
+    AUTO_RELEASED=$((AUTO_RELEASED + 1))
+    return 0
+  fi
+
+  local original_head
+  original_head=$(git rev-parse HEAD)
+
+  local override
+  if ! override=$(prompt_release_confirmation "$new_tag" "${target}: ${AUTO_BUMP_LEVEL} bump decided. "); then
+    echo "Skipped ${target}."
+    AUTO_SKIPPED=$((AUTO_SKIPPED + 1))
+    return 0
+  fi
+  if [[ -n "$override" && "$override" != "$AUTO_BUMP_LEVEL" ]]; then
+    AUTO_BUMP_LEVEL="$override"
+    new_version=$(bump_version "$current" "$override")
+    new_tag="${RELEASE_TAG_PREFIX}${new_version}"
+    ensure_new_tag_available "$new_tag"
+    echo "Overridden to ${override}: releasing ${new_tag} instead."
+  fi
+
+  if [[ "$RELEASE_MODE" == "npm" ]]; then
+    if [[ "$(git rev-parse HEAD)" != "$original_head" ]]; then
+      echo "HEAD changed while preparing the release; start again." >&2
+      return 1
+    fi
+    require_clean_npm_release_state
+    publish_npm_release_tag "$new_tag" "$new_version" "$AUTO_BUMP_NOTES" "$original_head"
+  else
+    create_release_tag "$new_tag" "$AUTO_BUMP_NOTES"
+    if ! git push origin "${new_tag}"; then
+      git tag -d "$new_tag" > /dev/null 2>&1 || true
+      return 1
+    fi
+    echo "Pushed ${new_tag} - CI release workflow will start automatically."
+  fi
+
+  AUTO_RELEASED=$((AUTO_RELEASED + 1))
+}
+
+cmd_bump_auto() {
+  local dry_run="$1"
+  local ai_cli
+  ai_cli=$(resolve_ai_cli "$AI_CLI")
+
+  if [[ "$RELEASE_MODE" != "npm" ]]; then
+    auto_release_one "$ai_cli" "$dry_run"
+    return
+  fi
+
+  local packages=() package
+  while IFS= read -r package; do
+    packages+=("$package")
+  done < <(list_release_packages)
+
+  if ((${#packages[@]} == 0)); then
+    echo "No packages configured in ${RELEASE_CONFIG_FILE}." >&2
+    exit 1
+  fi
+
+  for package in "${packages[@]}"; do
+    auto_release_one "$ai_cli" "$dry_run" "$package"
+    echo ""
+  done
+
+  if ((dry_run)); then
+    echo "Dry run complete: ${AUTO_RELEASED} release(s) would be created, ${AUTO_SKIPPED} skipped. No files or refs were changed."
+  else
+    echo "Auto release complete: ${AUTO_RELEASED} released, ${AUTO_SKIPPED} skipped."
+  fi
+}
+
 cmd_bump() {
   local part=""
   local version_override=""
@@ -700,6 +1122,17 @@ cmd_bump() {
   if [[ $# -eq 0 ]]; then
     print_bump_usage
     exit 1
+  fi
+
+  if [[ "$1" == "auto" ]]; then
+    shift
+    if [[ $# -gt 0 ]]; then
+      echo "bump auto does not take additional arguments." >&2
+      print_bump_usage
+      exit 1
+    fi
+    cmd_bump_auto "$dry_run"
+    return
   fi
 
   if [[ "$1" == "--version" ]]; then
@@ -744,35 +1177,7 @@ cmd_bump() {
 
   local latest current new_version new_tag
   latest=$(get_latest_tag "$RELEASE_TAG_PREFIX")
-  if [[ "$RELEASE_MODE" == "npm" ]]; then
-    current="$RELEASE_PACKAGE_VERSION"
-    if [[ -n "$latest" ]]; then
-      local tag_version
-      tag_version=$(parse_version "$latest" "$RELEASE_TAG_PREFIX")
-      if [[ "$tag_version" != "$current" ]]; then
-        # A manifest ahead of the latest tag with no local or remote tag of
-        # its own is the leftover of an interrupted bump: the version write
-        # happened but the release commit, tag, or push did not finish.
-        # Rebase the bump on the tag and let it own the version write again.
-        if (($(compare_versions "$current" "$tag_version") > 0)) &&
-          ! git rev-parse -q --verify "refs/tags/${RELEASE_TAG_PREFIX}${current}" > /dev/null 2>&1 &&
-          remote_tag_absent "${RELEASE_TAG_PREFIX}${current}"; then
-          echo "Manifest version $current was never tagged; recovering the interrupted release from baseline $latest."
-          if ((dry_run == 0)); then
-            git restore --source=HEAD --staged --worktree -- "$RELEASE_PACKAGE_MANIFEST"
-          fi
-          current="$tag_version"
-        else
-          echo "$RELEASE_PACKAGE manifest version $current does not match latest tag $latest." >&2
-          exit 1
-        fi
-      fi
-    fi
-  elif [[ -z "$latest" ]]; then
-    current="0.0.0"
-  else
-    current=$(parse_version "$latest")
-  fi
+  current=$(resolve_current_version "$latest" "$dry_run")
 
   if [[ -n "$version_override" ]]; then
     new_version="${version_override#v}"
@@ -788,13 +1193,7 @@ cmd_bump() {
     exit 1
   fi
 
-  if git rev-parse -q --verify "refs/tags/${new_tag}" > /dev/null 2>&1; then
-    echo "Tag ${new_tag} already exists." >&2
-    exit 1
-  fi
-  if [[ "$RELEASE_MODE" == "npm" ]]; then
-    ensure_remote_tag_absent "$new_tag"
-  fi
+  ensure_new_tag_available "$new_tag"
 
   if [[ "$RELEASE_MODE" == "npm" ]] && ((dry_run == 0)); then
     require_clean_npm_release_state
@@ -834,10 +1233,20 @@ cmd_bump() {
 
   local original_head
   original_head=$(git rev-parse HEAD)
-  read -rp "Create and push ${new_tag}? [Y/n] " confirm
-  if [[ "$confirm" == [nN] ]]; then
+  local override
+  if ! override=$(prompt_release_confirmation "$new_tag"); then
     echo "Aborted."
     exit 0
+  fi
+  if [[ -n "$override" ]]; then
+    local override_version
+    override_version=$(bump_version "$current" "$override")
+    if [[ "$override_version" != "$new_version" ]]; then
+      new_version="$override_version"
+      new_tag="${RELEASE_TAG_PREFIX}${new_version}"
+      ensure_new_tag_available "$new_tag"
+      echo "Overridden to ${override}: releasing ${new_tag} instead."
+    fi
   fi
 
   if [[ "$RELEASE_MODE" == "npm" ]]; then
